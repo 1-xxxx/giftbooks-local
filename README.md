@@ -1,3 +1,4 @@
+<img width="1065" height="892" alt="Screenshot 2026-09-25 at 12 15 40 PM" src="https://github.com/user-attachments/assets/6dcc4bc7-f8ce-4910-b7e0-e84132ee2a3a" />
 # GiftBooks Local
 
 GiftBooks Local uses your Mac's camera and a local vision model to identify a book and check whether the same edition appears in the Illinois Library Catalog.
@@ -64,11 +65,13 @@ Allow camera and microphone access when the browser asks.
 3. Click **Take photo**. A countdown runs from 1.0 to 0.0 seconds.
 4. Photograph at least the title page. Add the copyright or publication page when the edition and year matter.
 5. Click **Extract and check Illinois Library Catalog**.
-6. Review the extracted information and catalog result.
-7. If the result is not found, use **Open the Illinois Library Catalog search to verify** for a manual check.
-8. Choose **Keep** or **Give away**.
-9. Add an optional note of no more than 20 words.
-10. Click **Save result to Excel**, then choose **Next book**.
+   <img width="1065" height="892" alt="Screenshot 2026-09-25 at 12 15 40 PM" src="https://github.com/user-attachments/assets/c0d4301d-0d65-42b9-8963-7a41ac90402e" />
+7. Review the extracted information and catalog result.
+   <img width="1074" height="635" alt="Screenshot 2026-09-25 at 12 22 56 PM" src="https://github.com/user-attachments/assets/2088031f-48e4-496f-a93d-2600acf27bc5" />
+9. If the result is not found, use **Open the Illinois Library Catalog search to verify** for a manual check.
+10. Choose **Keep** or **Give away**.
+11. Add an optional note of no more than 20 words.
+12. Click **Save result to Excel**, then choose **Next book**.
 
 You can also upload JPEG, PNG, WebP, HEIC, or HEIF photographs instead of using the camera.
 
