@@ -1,4 +1,3 @@
-<img width="1065" height="892" alt="Screenshot 2026-09-25 at 12 15 40 PM" src="https://github.com/user-attachments/assets/6dcc4bc7-f8ce-4910-b7e0-e84132ee2a3a" />
 # GiftBooks Local
 
 GiftBooks Local uses your Mac's camera and a local vision model to identify a book and check whether the same edition appears in the Illinois Library Catalog.
