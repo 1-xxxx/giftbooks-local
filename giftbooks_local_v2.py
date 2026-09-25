@@ -1759,12 +1759,27 @@ def score_record(scanned: SearchMetadata, record: dict[str, Any]) -> tuple[float
     return round(score, 4), {name: round(value, 3) for name, (value, _) in components.items()}, exact_isbn
 
 
+def primo_query_value(query_parts: list[tuple[str, str, str]]) -> str:
+    """Build Primo's single compound q parameter for an advanced search."""
+    clauses: list[str] = []
+    for index, (field, operator, value) in enumerate(query_parts):
+        # Primo treats commas as query delimiters, so commas inside a value must
+        # become spaces. Boolean operators belong to the preceding clause.
+        safe_value = str(value or "").replace(",", " ")
+        clause = f"{field},{operator},{safe_value}"
+        if index < len(query_parts) - 1:
+            clause += ",AND"
+        clauses.append(clause)
+    return ";".join(clauses)
+
+
 def fetch_illinois_catalog(query_parts: list[tuple[str, str, str]]) -> list[dict[str, Any]]:
     params: list[tuple[str, str]] = [
         ("vid", "01CARLI_UIU:CARLI_UIU"), ("lang", "en"), ("offset", "0"),
-        ("limit", "20"), ("scope", "MyInstitution"), ("pfilter", "rtype,exact,books"),
+        ("limit", "20"), ("scope", "MyInstitution"), ("tab", "LibraryCatalog"),
+        ("pfilter", "rtype,exact,books,AND"),
     ]
-    params += [("q", ",".join(parts)) for parts in query_parts]
+    params.append(("q", primo_query_value(query_parts)))
     response = requests.get(
         ILLINOIS_CATALOG_BASE + "/primaws/rest/pub/pnxs", params=params,
         headers={"User-Agent": USER_AGENT, "Accept": "application/json"}, timeout=20,
@@ -1783,7 +1798,14 @@ def search_illinois_catalog(metadata: SearchMetadata) -> dict[str, Any]:
     title_query = [("title", "contains", metadata.title or "")]
     if metadata.authors:
         title_query.append(("creator", "contains", metadata.authors[0]))
-    documents.extend(fetch_illinois_catalog(title_query))
+    title_documents = fetch_illinois_catalog(title_query)
+    documents.extend(title_documents)
+    # Some Primo installations apply advanced-field searches more strictly than
+    # the public catalog interface. A title-only fallback prevents a valid book
+    # from disappearing; the local relevance checks below still require the
+    # scanned author to match before reporting Found.
+    if metadata.authors and metadata.title and not title_documents:
+        documents.extend(fetch_illinois_catalog([("title", "contains", metadata.title)]))
     records: dict[str, dict[str, Any]] = {}
     for document in documents:
         record = record_from_doc(document)
