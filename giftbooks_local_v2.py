@@ -54,6 +54,8 @@ APP_NAME = "GiftBooks Illinois Library Checker"
 MODEL_NAME = os.getenv("GIFTBOOKS_MODEL", "mlx-community/Qwen3-VL-8B-Instruct-4bit")
 PORT = int(os.getenv("GIFTBOOKS_PORT", "8502"))
 ILLINOIS_CATALOG_BASE = "https://i-share-uiu.primo.exlibrisgroup.com"
+ILLINOIS_CATALOG_VIEW = "01CARLI_UIU:CARLI_UIU_NDE"
+ILLINOIS_INSTITUTION = "01CARLI_UIU"
 USER_AGENT = "GiftBooksIllinoisLibraryChecker/1.0 (local research workflow)"
 ROLES = ["title_page", "copyright_page", "front_cover", "back_cover", "spine", "other"]
 DATA_ROOT = Path(__file__).resolve().parent / "data"
@@ -1621,8 +1623,14 @@ def text_similarity(left: Any, right: Any) -> float:
     sequence = SequenceMatcher(None, a, b).ratio()
     a_tokens, b_tokens = set(a.split()), set(b.split())
     overlap = len(a_tokens & b_tokens) / len(a_tokens | b_tokens)
+    # Catalog titles often add a subtitle, and creator fields often add dates
+    # and role labels. Do not penalize an exact multi-word core title/name just
+    # because the catalog record contains that extra bibliographic detail.
+    shorter_count = min(len(a_tokens), len(b_tokens))
+    coverage = len(a_tokens & b_tokens) / shorter_count
+    contained_core = 1.0 if shorter_count >= 2 and coverage == 1.0 else coverage * .9
     order_free = SequenceMatcher(None, " ".join(sorted(a_tokens)), " ".join(sorted(b_tokens))).ratio()
-    return max(sequence, overlap, order_free)
+    return max(sequence, overlap, contained_core, order_free)
 
 
 def parse_year(value: Any) -> int | None:
@@ -1670,22 +1678,24 @@ def flatten_strings(value: Any) -> list[str]:
 
 
 def illinois_search_url(metadata: SearchMetadata) -> str:
+    query_parts = [("title", "contains", metadata.title or "")]
+    if metadata.authors:
+        query_parts.append(("creator", "contains", metadata.authors[0]))
     params = [
-        ("query", f"title,contains,{metadata.title or ''},AND"),
-        ("query", f"creator,contains,{metadata.authors[0] if metadata.authors else ''},AND"),
+        ("query", primo_query_value(query_parts)),
         ("tab", "LibraryCatalog"), ("search_scope", "MyInstitution"),
-        ("vid", "01CARLI_UIU:CARLI_UIU"), ("lang", "en"),
+        ("vid", ILLINOIS_CATALOG_VIEW), ("lang", "en"),
         ("mode", "advanced"), ("offset", "0"),
     ]
-    return ILLINOIS_CATALOG_BASE + "/discovery/search?" + urlencode(params)
+    return ILLINOIS_CATALOG_BASE + "/nde/search?" + urlencode(params)
 
 
 def illinois_record_url(record_id: str) -> str:
     params = {
-        "docid": record_id, "context": "L", "vid": "01CARLI_UIU:CARLI_UIU",
+        "docid": record_id, "context": "L", "vid": ILLINOIS_CATALOG_VIEW,
         "lang": "en", "search_scope": "MyInstitution",
     }
-    return ILLINOIS_CATALOG_BASE + "/discovery/fulldisplay?" + urlencode(params)
+    return ILLINOIS_CATALOG_BASE + "/nde/fulldisplay?" + urlencode(params)
 
 
 def record_from_doc(doc: dict[str, Any]) -> dict[str, Any]:
@@ -1775,9 +1785,10 @@ def primo_query_value(query_parts: list[tuple[str, str, str]]) -> str:
 
 def fetch_illinois_catalog(query_parts: list[tuple[str, str, str]]) -> list[dict[str, Any]]:
     params: list[tuple[str, str]] = [
-        ("vid", "01CARLI_UIU:CARLI_UIU"), ("lang", "en"), ("offset", "0"),
+        ("vid", ILLINOIS_CATALOG_VIEW), ("inst", ILLINOIS_INSTITUTION),
+        ("lang", "en"), ("offset", "0"),
         ("limit", "20"), ("scope", "MyInstitution"), ("tab", "LibraryCatalog"),
-        ("pfilter", "rtype,exact,books,AND"),
+        ("qInclude", "facet_rtype,exact,books"), ("qExclude", ""), ("sort", "rank"),
     ]
     params.append(("q", primo_query_value(query_parts)))
     response = requests.get(
@@ -1795,16 +1806,9 @@ def search_illinois_catalog(metadata: SearchMetadata) -> dict[str, Any]:
     isbn = metadata.isbn13 or metadata.isbn10
     if isbn:
         documents.extend(fetch_illinois_catalog([("isbn", "exact", isbn)]))
-    title_query = [("title", "contains", metadata.title or "")]
-    if metadata.authors:
-        title_query.append(("creator", "contains", metadata.authors[0]))
-    title_documents = fetch_illinois_catalog(title_query)
-    documents.extend(title_documents)
-    # Some Primo installations apply advanced-field searches more strictly than
-    # the public catalog interface. A title-only fallback prevents a valid book
-    # from disappearing; the local relevance checks below still require the
-    # scanned author to match before reporting Found.
-    if metadata.authors and metadata.title and not title_documents:
+    # Search by title and validate creators locally. This avoids Primo's stricter
+    # advanced-query behavior while retaining the author threshold below.
+    if metadata.title:
         documents.extend(fetch_illinois_catalog([("title", "contains", metadata.title)]))
     records: dict[str, dict[str, Any]] = {}
     for document in documents:
@@ -2047,9 +2051,11 @@ async function addUploads(files){if(files.length&&scanStartedAt===null)scanStart
 function metadataFromForm(){const year=$('publication_year').value.trim();return{title:$('title').value.trim()||null,authors:$('authors').value.split('\n').map(x=>x.trim()).filter(Boolean),publication_year:/^\d{4}$/.test(year)?Number(year):null,publisher:$('publisher').value.trim()||null,publication_place:$('publication_place').value.trim()||null,edition:$('edition').value.trim()||null,language:$('language').value.trim()||null,isbn10:$('isbn10').value.trim()||null,isbn13:$('isbn13').value.trim()||null,warnings:[]};}
 function fillForm(metadata){['title','publication_year','publisher','publication_place','edition','language','isbn10','isbn13'].forEach(key=>$(key).value=metadata[key]??'');$('authors').value=(metadata.authors||[]).join('\n');}
 function playResultSound(found){const selected=found?resultSounds.found:resultSounds.notFound,other=found?resultSounds.notFound:resultSounds.found;other.pause();other.currentTime=0;selected.pause();selected.currentTime=0;selected.play().catch(()=>{});}
+function reserveCatalogTab(){const tab=window.open('about:blank','_blank');if(tab){tab.document.title='Illinois Library Catalog search';tab.document.body.innerHTML='<p style="font:16px system-ui;padding:24px">Extracting book information. The Illinois Library Catalog search will open here…</p>';}return tab;}
+function redirectCatalogTab(tab,url){if(!url)return false;if(tab&&!tab.closed){tab.location.replace(url);tab.focus();return true;}return Boolean(window.open(url,'_blank','noopener'));}
 function unlockDisposition(){document.querySelectorAll('input[name="decision"]').forEach(input=>input.disabled=false);$('note').disabled=false;$('saveResult').disabled=false;}
 function showResult(result){currentResult=result;resultSaved=false;unlockDisposition();$('resultCard').classList.remove('hidden');$('decisionCard').classList.remove('hidden');const found=result.status==='found',kind=found?'found':'notfound',elapsed=resultElapsedSeconds===null?'':`<br><span class="muted">From first photo command to displayed result: ${resultElapsedSeconds.toFixed(1)} seconds</span>`;setStatus('resultBanner',`<b>${found?'FOUND':'NOT FOUND'}</b><br>${escapeHtml(result.message)}${elapsed}`,kind);playResultSound(found);const record=found?result.record:null;if(!record){const verification=result.search_url?`<p><a href="${escapeHtml(result.search_url)}" target="_blank" rel="noopener"><b>Open the Illinois Library Catalog search to verify</b></a></p>`:'';$('recordDetails').innerHTML='<p>No exact matching Illinois Library Catalog record was returned.</p>'+verification;}else{const authors=(record.authors||[]).join('; ')||'—';$('recordDetails').innerHTML=`<table><tr><th>Title</th><td>${escapeHtml(record.title||'—')}</td></tr><tr><th>Author</th><td>${escapeHtml(authors)}</td></tr><tr><th>Publication</th><td>${escapeHtml([record.publication_place,record.publisher,record.publication_year].filter(Boolean).join(' · ')||'—')}</td></tr><tr><th>Edition</th><td>${escapeHtml(record.edition||'—')}</td></tr><tr><th>Availability</th><td>${escapeHtml(record.availability||'See catalog record')}</td></tr></table><p><a href="${escapeHtml(record.record_url)}" target="_blank" rel="noopener"><b>Open this Illinois Library Catalog record</b></a></p>`;}setStatus('saveStatus','Choose Keep or Give away before saving.');$('resultCard').scrollIntoView({behavior:'smooth'});}
-async function checkBook(voice=false){if(operationBusy){if(voice)voiceFeedback('Please wait for the current check.','different');return;}if(!images.length){if(voice)voiceFeedback('Take at least one photo first.','different');return;}if(scanStartedAt===null)scanStartedAt=performance.now();operationBusy=true;setStatus('checkStatus','<span class="spinner"></span>Extracting scan information and checking the Illinois Library Catalog…');$('check').disabled=true;try{const response=await fetch('/api/check',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({images})});const result=await response.json();if(!response.ok)throw new Error(result.error||'Check failed');fillForm(result.metadata);$('searchCard').classList.remove('hidden');resultElapsedSeconds=Math.round((performance.now()-scanStartedAt)/100)/10;showResult(result.result);setStatus('checkStatus',`Illinois Library Catalog check completed in ${resultElapsedSeconds.toFixed(1)} seconds from the first photo command.`,'found');if(voice)setTimeout(()=>announceResult(result.result),1450);}catch(error){setStatus('checkStatus',escapeHtml(error.message),'error');if(voice)voiceFeedback('The library check failed. '+error.message,'error');}finally{operationBusy=false;$('check').disabled=!images.length;}}
+async function checkBook(voice=false){if(operationBusy){if(voice)voiceFeedback('Please wait for the current check.','different');return;}if(!images.length){if(voice)voiceFeedback('Take at least one photo first.','different');return;}if(scanStartedAt===null)scanStartedAt=performance.now();const catalogTab=reserveCatalogTab();operationBusy=true;setStatus('checkStatus','<span class="spinner"></span>Extracting scan information and checking the Illinois Library Catalog…');$('check').disabled=true;try{const response=await fetch('/api/check',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({images})});const result=await response.json();if(!response.ok)throw new Error(result.error||'Check failed');fillForm(result.metadata);$('searchCard').classList.remove('hidden');resultElapsedSeconds=Math.round((performance.now()-scanStartedAt)/100)/10;showResult(result.result);const catalogOpened=redirectCatalogTab(catalogTab,result.result.search_url);setStatus('checkStatus',`Illinois Library Catalog check completed in ${resultElapsedSeconds.toFixed(1)} seconds from the first photo command.${catalogOpened?' Catalog search opened in a new tab.':' Your browser blocked the automatic catalog tab; use the catalog link in the result.'}`,'found');if(voice)setTimeout(()=>announceResult(result.result),1450);}catch(error){if(catalogTab&&!catalogTab.closed)catalogTab.close();setStatus('checkStatus',escapeHtml(error.message),'error');if(voice)voiceFeedback('The library check failed. '+error.message,'error');}finally{operationBusy=false;$('check').disabled=!images.length;}}
 async function searchAgain(voice=false){if(operationBusy)return;operationBusy=true;setStatus('checkStatus','<span class="spinner"></span>Searching the Illinois Library Catalog again…');try{const response=await fetch('/api/search',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({metadata:metadataFromForm()})});const result=await response.json();if(!response.ok)throw new Error(result.error||'Search failed');showResult(result.result);setStatus('checkStatus','Illinois Library Catalog search complete.','found');if(voice)setTimeout(()=>announceResult(result.result),1450);}catch(error){setStatus('checkStatus',escapeHtml(error.message),'error');if(voice)voiceFeedback('The library search failed. '+error.message,'error');}finally{operationBusy=false;}}
 function selectedDecision(){return document.querySelector('input[name="decision"]:checked')?.value||'';}
 function wordCount(value){return(value.trim().match(/\S+/g)||[]).length;}
