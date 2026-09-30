@@ -22,6 +22,7 @@ an online speech service.
 from __future__ import annotations
 
 import base64
+import io
 import json
 import math
 import os
@@ -31,11 +32,12 @@ import threading
 import time
 import unicodedata
 import webbrowser
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 
 import requests
 from flask import Flask, jsonify, render_template_string, request
@@ -61,6 +63,7 @@ ROLES = ["title_page", "copyright_page", "front_cover", "back_cover", "spine", "
 DATA_ROOT = Path(__file__).resolve().parent / "data"
 RESULTS_WORKBOOK_PATH = DATA_ROOT / "illinois_library_scan_results.xlsx"
 RESULTS_SHEET = "Scan Results"
+FAST_IMAGE_SIZE = max(1000, min(1800, int(os.getenv("GIFTBOOKS_FAST_IMAGE_SIZE", "1400"))))
 RESULT_HEADERS = [
     "Scan ID", "Title", "Authors", "Publication Year", "Edition", "Publisher",
     "Publication Place", "Detected Language", "ISBN 10", "ISBN 13",
@@ -1476,6 +1479,8 @@ app.config["MAX_CONTENT_LENGTH"] = 80 * 1024 * 1024
 _model_lock = threading.Lock()
 _workbook_lock = threading.Lock()
 _model_bundle: tuple[Any, Any, Any] | None = None
+_catalog_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="catalog")
+_catalog_local = threading.local()
 
 
 class SearchMetadata(BaseModel):
@@ -1574,7 +1579,7 @@ def get_model_bundle() -> tuple[Any, Any, Any]:
     return _model_bundle
 
 
-def extract_search_metadata(images: list[dict[str, Any]]) -> tuple[SearchMetadata, str]:
+def extract_search_metadata(images: list[dict[str, Any]], fast: bool = False) -> tuple[SearchMetadata, str]:
     if not images:
         raise ValueError("Capture or upload at least one image.")
     if len(images) > 8:
@@ -1582,19 +1587,18 @@ def extract_search_metadata(images: list[dict[str, Any]]) -> tuple[SearchMetadat
     roles = [str(item.get("role") or "other") for item in images]
     if any(role not in ROLES for role in roles):
         raise ValueError("One or more image roles are invalid.")
-    model, processor, config = get_model_bundle()
     with tempfile.TemporaryDirectory(prefix="giftbooks-illinois-") as directory:
         paths: list[str] = []
         for index, item in enumerate(images):
             content, suffix = decode_data_url(item.get("data", ""))
-            source = Path(directory) / f"source-{index}{suffix}"
-            source.write_bytes(content)
             destination = Path(directory) / f"normalized-{index}.jpg"
-            with Image.open(source) as image:
+            with Image.open(io.BytesIO(content)) as image:
                 normalized = ImageOps.exif_transpose(image).convert("RGB")
-                normalized.thumbnail((1800, 1800))
+                edge = FAST_IMAGE_SIZE if fast else 1800
+                normalized.thumbnail((edge, edge))
                 normalized.save(destination, "JPEG", quality=92)
             paths.append(str(destination))
+        model, processor, config = get_model_bundle()
         prompt = apply_chat_template(
             processor, config, extraction_prompt(roles), num_images=len(paths)
         )
@@ -1791,7 +1795,9 @@ def fetch_illinois_catalog(query_parts: list[tuple[str, str, str]]) -> list[dict
         ("qInclude", "facet_rtype,exact,books"), ("qExclude", ""), ("sort", "rank"),
     ]
     params.append(("q", primo_query_value(query_parts)))
-    response = requests.get(
+    if not hasattr(_catalog_local, "session"):
+        _catalog_local.session = requests.Session()
+    response = _catalog_local.session.get(
         ILLINOIS_CATALOG_BASE + "/primaws/rest/pub/pnxs", params=params,
         headers={"User-Agent": USER_AGENT, "Accept": "application/json"}, timeout=20,
     )
@@ -1804,12 +1810,18 @@ def search_illinois_catalog(metadata: SearchMetadata) -> dict[str, Any]:
         raise ValueError("The images did not provide a title or ISBN. Photograph the title page.")
     documents: list[dict[str, Any]] = []
     isbn = metadata.isbn13 or metadata.isbn10
+    queries = []
     if isbn:
-        documents.extend(fetch_illinois_catalog([("isbn", "exact", isbn)]))
+        queries.append([("isbn", "exact", isbn)])
     # Search by title and validate creators locally. This avoids Primo's stricter
     # advanced-query behavior while retaining the author threshold below.
     if metadata.title:
-        documents.extend(fetch_illinois_catalog([("title", "contains", metadata.title)]))
+        queries.append([("title", "contains", metadata.title)])
+    # Overlap independent requests and reuse connections across scans. Propagate
+    # failures rather than reporting a partially searched catalog as Not Found.
+    futures = [_catalog_pool.submit(fetch_illinois_catalog, query) for query in queries]
+    for future in futures:
+        documents.extend(future.result())
     records: dict[str, dict[str, Any]] = {}
     for document in documents:
         record = record_from_doc(document)
@@ -1901,9 +1913,47 @@ def excel_text(value: str | None) -> str | None:
     return "'" + text if text.startswith(("=", "+", "-", "@")) else text
 
 
+def processing_seconds(value: Any) -> float | None:
+    if value is None:
+        return None
+    seconds = float(value)
+    if not math.isfinite(seconds) or not 0 <= seconds <= 86400:
+        raise ValueError("The processing time is invalid.")
+    return round(seconds, 1)
+
+
+def conversation_files(scan_id: str, conversation: dict[str, Any]) -> dict[str, bytes]:
+    """Validate recording data before writing either the workbook or sidecars."""
+    if not isinstance(conversation, dict):
+        raise ValueError("The conversation data is invalid.")
+    transcript = conversation.get("transcript") or []
+    if not isinstance(transcript, list) or len(transcript) > 1000:
+        raise ValueError("The conversation transcript is invalid.")
+    for entry in transcript:
+        if not isinstance(entry, dict) or not isinstance(entry.get("text"), str) or len(entry["text"]) > 10000:
+            raise ValueError("The conversation transcript is invalid.")
+    files: dict[str, bytes] = {}
+    audio = conversation.get("audio")
+    if audio:
+        match = re.fullmatch(r"data:(audio/(?:webm|ogg|mp4|mpeg))(?:;codecs=[^;,]+)?;base64,(.+)", str(audio), re.S)
+        if not match:
+            raise ValueError("The conversation audio format is invalid.")
+        content = base64.b64decode(match[2], validate=True)
+        if len(content) > 12 * 1024 * 1024:
+            raise ValueError("The conversation recording is too large.")
+        suffix = {"audio/webm": ".webm", "audio/ogg": ".ogg", "audio/mp4": ".m4a", "audio/mpeg": ".mp3"}[match[1]]
+        files[scan_id + suffix] = content
+    if transcript or files:
+        info = {"scan_id": scan_id, "transcript": transcript,
+                "audio_file": next(iter(files), None)}
+        files[scan_id + ".json"] = json.dumps(info, ensure_ascii=False, indent=2).encode("utf-8")
+    return files
+
+
 def save_scan_result(
     metadata: SearchMetadata, result: dict[str, Any], decision: str,
     note: str, elapsed_seconds: float | None,
+    conversation: dict[str, Any] | None = None,
 ) -> dict[str, str]:
     normalized_decision = decision.strip().lower()
     if normalized_decision not in {"keep", "give away"}:
@@ -1911,21 +1961,18 @@ def save_scan_result(
     cleaned_note = " ".join(note.strip().split())
     if len(re.findall(r"\S+", cleaned_note)) > 20:
         raise ValueError("The note must contain no more than 20 words.")
-    if elapsed_seconds is not None:
-        elapsed_seconds = float(elapsed_seconds)
-        if not math.isfinite(elapsed_seconds) or elapsed_seconds < 0 or elapsed_seconds > 86400:
-            raise ValueError("The processing time is invalid.")
-        elapsed_seconds = round(elapsed_seconds, 1)
+    elapsed_seconds = processing_seconds(elapsed_seconds)
     status = "Found" if result.get("status") == "found" else "Not Found"
     record = result.get("record") if status == "Found" else None
     catalog_url = record.get("record_url") if isinstance(record, dict) else result.get("search_url")
-    allowed_record_prefix = ILLINOIS_CATALOG_BASE + "/discovery/fulldisplay?"
-    allowed_search_prefix = ILLINOIS_CATALOG_BASE + "/discovery/search?"
-    allowed_prefix = allowed_record_prefix if status == "Found" else allowed_search_prefix
-    if catalog_url and not str(catalog_url).startswith(allowed_prefix):
-        raise ValueError("The Illinois Library Catalog URL is invalid.")
+    if catalog_url:
+        parsed = urlparse(str(catalog_url))
+        allowed_paths = {"/nde/fulldisplay", "/nde/search", "/discovery/fulldisplay", "/discovery/search"}
+        if parsed.scheme != "https" or parsed.netloc != urlparse(ILLINOIS_CATALOG_BASE).netloc or parsed.path not in allowed_paths:
+            raise ValueError("The Illinois Library Catalog URL is invalid.")
     checked_at = datetime.now(timezone.utc)
     scan_id = "scan_" + checked_at.strftime("%Y%m%d_%H%M%S_%f")
+    sidecars = conversation_files(scan_id, conversation or {})
     row = [
         scan_id, excel_text(metadata.title), excel_text("; ".join(metadata.authors)), metadata.publication_year,
         excel_text(metadata.edition), excel_text(metadata.publisher), excel_text(metadata.publication_place),
@@ -1946,9 +1993,50 @@ def save_scan_result(
             link_cell.hyperlink = catalog_url
             link_cell.style = "Hyperlink"
         temporary_path = RESULTS_WORKBOOK_PATH.with_suffix(".tmp.xlsx")
-        workbook.save(temporary_path)
-        os.replace(temporary_path, RESULTS_WORKBOOK_PATH)
+        written: list[Path] = []
+        try:
+            if sidecars:
+                recordings = DATA_ROOT / "conversations"
+                recordings.mkdir(parents=True, exist_ok=True)
+                for filename, content in sidecars.items():
+                    path = recordings / filename
+                    written.append(path)
+                    path.write_bytes(content)
+            workbook.save(temporary_path)
+            os.replace(temporary_path, RESULTS_WORKBOOK_PATH)
+        except Exception:
+            for path in written:
+                path.unlink(missing_ok=True)
+            temporary_path.unlink(missing_ok=True)
+            raise
+        finally:
+            workbook.close()
     return {"scan_id": scan_id, "workbook": str(RESULTS_WORKBOOK_PATH)}
+
+
+def finalize_processing_time(scan_id: str, elapsed_seconds: Any) -> dict[str, Any]:
+    seconds = processing_seconds(elapsed_seconds)
+    if seconds is None or not re.fullmatch(r"scan_\d{8}_\d{6}_\d{6}", scan_id):
+        raise ValueError("The scan ID or processing time is invalid.")
+    with _workbook_lock:
+        if not RESULTS_WORKBOOK_PATH.exists():
+            raise ValueError("The saved scan could not be found.")
+        workbook = load_workbook(RESULTS_WORKBOOK_PATH)
+        temporary_path = RESULTS_WORKBOOK_PATH.with_suffix(".tmp.xlsx")
+        try:
+            sheet = prepare_results_sheet(workbook)
+            # The current scan is normally the last row; search backward for
+            # robustness if another browser session has saved a later scan.
+            for row in range(sheet.max_row, 1, -1):
+                if sheet.cell(row, 1).value == scan_id:
+                    sheet.cell(row, RESULT_HEADERS.index("Processing Time Seconds") + 1, seconds)
+                    workbook.save(temporary_path)
+                    os.replace(temporary_path, RESULTS_WORKBOOK_PATH)
+                    return {"scan_id": scan_id, "elapsed_seconds": seconds}
+            raise ValueError("The saved scan could not be found.")
+        finally:
+            workbook.close()
+            temporary_path.unlink(missing_ok=True)
 
 
 HTML = r"""
@@ -1965,7 +2053,8 @@ HTML = r"""
     .grid{display:grid;grid-template-columns:1.2fr .8fr;gap:18px}.formgrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px 16px}.wide{grid-column:1/-1}
     label{display:block;font-weight:650;font-size:13px;margin-bottom:5px}input,select,textarea{width:100%;border:1px solid #b9c5d2;border-radius:7px;padding:9px 10px;font:inherit;background:white}textarea{min-height:74px}
     button{border:0;border-radius:8px;padding:10px 15px;font-weight:700;cursor:pointer;background:var(--blue);color:white}button.secondary{background:#e8eef5;color:#1f3c61}button.danger{background:#a73737}button:disabled{opacity:.45;cursor:not-allowed}.actions{display:flex;flex-wrap:wrap;gap:9px;align-items:center;margin-top:12px}
-    video{width:100%;max-height:480px;background:#111;border-radius:10px;object-fit:contain}.video-wrap{position:relative}#countdown{position:absolute;inset:0;display:none;place-items:center;color:white;font-size:96px;font-weight:800;text-shadow:0 3px 18px #000;background:#0003;border-radius:10px}
+    video{width:100%;max-height:480px;background:#111;border-radius:10px;object-fit:contain}.video-wrap{position:relative}
+    .toolbar{display:flex;flex-wrap:wrap;gap:16px;align-items:center}.toolbar select{width:auto}.timer{font-variant-numeric:tabular-nums}#voiceTranscript{white-space:pre-wrap;max-height:180px;overflow:auto;font:14px system-ui;background:#f5f7fa;padding:12px;border-radius:8px}
     .gallery{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:10px;margin-top:14px}.shot{border:1px solid var(--line);border-radius:9px;padding:8px}.shot img{width:100%;height:130px;object-fit:cover;border-radius:6px}.shot select{margin:7px 0}
     .status{padding:12px;border-radius:8px;background:#eaf1f8;margin-top:10px}.found{background:#e3f5e8;color:#174d26;border-left:6px solid #2d8a45}.different{background:#fff3d5;color:#654d08;border-left:6px solid #d89c18}.notfound{background:#ffe6e6;color:#762323;border-left:6px solid #b63b3b}.error{background:#ffe6e6;color:#762323}.hidden{display:none!important}.muted{color:var(--muted)}
     table{border-collapse:collapse;width:100%;margin-top:12px}th,td{border:1px solid var(--line);padding:9px;text-align:left;vertical-align:top}th{width:190px;background:#f2f5f8}.spinner{display:inline-block;width:16px;height:16px;border:2px solid #b9c5d2;border-top-color:var(--blue);border-radius:50%;animation:spin .8s linear infinite;vertical-align:-3px;margin-right:6px}@keyframes spin{to{transform:rotate(360deg)}}
@@ -1976,16 +2065,22 @@ HTML = r"""
 <body>
 <header><h1>GiftBooks Illinois Library Checker</h1><div class="muted">Photograph a book and check whether its edition is in the Illinois Library Catalog.</div></header>
 <main>
+  <section class="card toolbar">
+    <div><label for="workflowMode">Workflow</label><select id="workflowMode"><option value="traditional">Traditional mode</option><option value="fast">Fast mode</option></select></div>
+    <button id="nextBook" class="secondary">Next book</button>
+    <span id="bookTimer" class="timer">Book time: 0.0 s</span><span id="lastBookTime" class="muted"></span>
+    <p id="modeHelp" class="muted wide">Traditional mode: photograph the pages you need, then extract and check manually.</p>
+  </section>
   <section class="card">
     <h2>1 Photograph the book</h2>
     <div class="grid">
-      <div><div class="video-wrap"><video id="video" autoplay playsinline muted></video><div id="countdown">1.0</div></div><canvas id="canvas" class="hidden"></canvas></div>
+      <div><div class="video-wrap"><video id="video" autoplay playsinline muted></video></div><canvas id="canvas" class="hidden"></canvas></div>
       <div>
         <label>Page being photographed</label><select id="role"></select>
         <div class="actions"><button id="startCamera">Start camera</button><button id="takePhoto" disabled>Take photo</button></div>
         <h3>Hands-free mode</h3>
         <p class="muted">Press Enter once, then say commands such as <b>title page</b>, <b>take photo</b>, <b>check library</b>, and <b>next book</b>.</p>
-        <label><input id="localSpeech" type="checkbox" style="width:auto"> Require on-device recognition when supported</label>
+        <label><input id="localSpeech" type="checkbox" style="width:auto"> Require on-device speech recognition</label>
         <div class="actions"><button id="voiceToggle" class="secondary">Enable hands-free mode</button></div>
         <div id="voiceStatus" class="status">Voice control is off.</div>
         <details><summary>Voice commands</summary><p class="muted">title page; copyright page; front cover; back cover; spine; take photo; remove last photo; clear photos; check library; set title …; set author …; set year …; set language …; search again; read result; keep book; give away; set note …; clear note; save result; next book; yes; no; help; stop listening.</p></details>
@@ -2027,7 +2122,10 @@ HTML = r"""
       <label class="choice"><input type="radio" name="decision" value="give away"> Give away</label>
     </div>
     <div style="margin-top:14px"><label for="note">Optional note (20 words maximum)</label><textarea id="note" placeholder="Add a short note about this book"></textarea><div id="noteCount" class="word-count muted">0 / 20 words</div></div>
-    <div class="actions"><button id="saveResult">Save result to Excel</button><button id="nextBook" class="secondary">Next book</button></div>
+    <div id="conversationStatus" class="status">Fast mode records the decision conversation after the catalog check.</div>
+    <div id="voiceTranscript" aria-live="polite">No conversation recorded.</div>
+    <div class="actions"><button id="listenDecision" class="secondary">Listen for a decision</button><button id="reviewNow" class="secondary">Stop listening and review</button></div>
+    <div class="actions"><button id="saveResult">Save result to Excel</button><button id="nextBookBottom" class="secondary">Next book</button></div>
     <div id="saveStatus" class="status">Choose Keep or Give away before saving.</div>
   </section>
 </main>
@@ -2035,84 +2133,294 @@ HTML = r"""
 const roles={{ roles|tojson }};
 const resultSounds={found:new Audio({{ found_sound|tojson }}),notFound:new Audio({{ not_found_sound|tojson }})};
 Object.values(resultSounds).forEach(audio=>audio.preload='auto');
-let images=[],stream=null,recognition=null,voiceEnabled=false,captureBusy=false,operationBusy=false;
-let pendingVoiceAction=null,currentResult=null,ignoreSpeechUntil=0,lastCommand='',lastCommandAt=0;
-let scanStartedAt=null,resultElapsedSeconds=null,resultSaved=false;
 const $=id=>document.getElementById(id),roleSelect=$('role');
+let images=[],stream=null,recognition=null,voiceEnabled=false,operationBusy=false,captureBusy=false;
+let currentResult=null,resultSaved=false,savedScanId=null,scanStartedAt=null,resultElapsedSeconds=null;
+let pendingVoiceAction=null,ignoreSpeechUntil=0,lastCommand='',lastCommandAt=0,warmupPromise=null;
+let bookGeneration=0;
+let workflowPhase='capture',decisionListening=false,decisionTimer=null,decisionProposal=null;
+let catalogWindow=null,transcript=[],audioStream=null,recorder=null,audioBlob=null,recordingDone=Promise.resolve();
+let recordingTimer=null,voiceRestartTimer=null,voiceGeneration=0,conversationGeneration=0;
 roles.forEach(role=>{const option=document.createElement('option');option.value=role;option.textContent=role.replaceAll('_',' ');roleSelect.appendChild(option);});
+function fastMode(){return $('workflowMode').value==='fast';}
 function escapeHtml(value){return String(value??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));}
 function setStatus(id,message,kind=''){const element=$(id);element.className='status'+(kind?' '+kind:'');element.innerHTML=message;}
-function beep(frequency=880,duration=.12){try{const context=new(window.AudioContext||window.webkitAudioContext)(),osc=context.createOscillator(),gain=context.createGain();osc.frequency.value=frequency;gain.gain.value=.08;osc.connect(gain);gain.connect(context.destination);osc.start();gain.gain.exponentialRampToValueAtTime(.001,context.currentTime+duration);osc.stop(context.currentTime+duration);}catch(e){}}
-async function startCamera(){if(stream)return true;try{stream=await navigator.mediaDevices.getUserMedia({video:{width:{ideal:1920},height:{ideal:1080},facingMode:{ideal:'environment'}},audio:false});$('video').srcObject=stream;$('takePhoto').disabled=false;$('startCamera').disabled=true;$('startCamera').textContent='Camera active';return true;}catch(error){setStatus('checkStatus','Camera unavailable: '+escapeHtml(error.message),'error');return false;}}
-function captureFrame(){const video=$('video');if(!stream||!video.videoWidth)return;const canvas=$('canvas');canvas.width=video.videoWidth;canvas.height=video.videoHeight;canvas.getContext('2d').drawImage(video,0,0,canvas.width,canvas.height);images.push({data:canvas.toDataURL('image/jpeg',.93),role:roleSelect.value,name:`camera_${images.length+1}.jpg`});renderGallery();beep();setStatus('voiceStatus',`Captured ${escapeHtml(roleSelect.value.replaceAll('_',' '))}.`,'found');}
-function countdownCapture(){if(captureBusy||!stream)return;if(scanStartedAt===null)scanStartedAt=performance.now();resultSaved=false;captureBusy=true;let tenths=10;const overlay=$('countdown');overlay.style.display='grid';overlay.textContent='1.0';const timer=setInterval(()=>{tenths--;overlay.textContent=(tenths/10).toFixed(1);if(tenths<=0){clearInterval(timer);setTimeout(()=>{captureFrame();overlay.style.display='none';captureBusy=false;},80);}},100);}
-function renderGallery(){const gallery=$('gallery');gallery.innerHTML='';images.forEach((item,index)=>{const card=document.createElement('div');card.className='shot';const image=document.createElement('img');image.src=item.data;card.appendChild(image);const select=document.createElement('select');roles.forEach(role=>{const option=document.createElement('option');option.value=role;option.textContent=role.replaceAll('_',' ');option.selected=role===item.role;select.appendChild(option);});select.onchange=()=>images[index].role=select.value;card.appendChild(select);const remove=document.createElement('button');remove.className='danger';remove.textContent='Remove';remove.onclick=()=>{images.splice(index,1);renderGallery();};card.appendChild(remove);gallery.appendChild(card);});$('imageCount').textContent=`${images.length} image${images.length===1?'':'s'}`;$('check').disabled=!images.length;$('clearPhotos').disabled=!images.length;}
-async function addUploads(files){if(files.length&&scanStartedAt===null)scanStartedAt=performance.now();resultSaved=false;for(const file of files){const data=await new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(reader.result);reader.onerror=reject;reader.readAsDataURL(file);});const lower=file.name.toLowerCase();const role=lower.includes('copyright')?'copyright_page':lower.includes('title')?'title_page':lower.includes('spine')?'spine':lower.includes('back')?'back_cover':lower.includes('cover')?'front_cover':'other';images.push({data,role,name:file.name});}renderGallery();}
+function beginTiming(at=performance.now()){if(scanStartedAt===null)scanStartedAt=at;updateTimer();}
+function elapsedSeconds(at=performance.now()){return scanStartedAt===null?0:Math.round((at-scanStartedAt)/100)/10;}
+function updateTimer(){$('bookTimer').textContent=`Book time: ${elapsedSeconds().toFixed(1)} s`;}
+setInterval(updateTimer,200);
+function syncControls(){
+  $('takePhoto').disabled=!stream||operationBusy||captureBusy||resultSaved||(fastMode()&&workflowPhase!=='capture');
+  $('check').disabled=!images.length||operationBusy||decisionListening||resultSaved;
+  $('clearPhotos').disabled=!images.length||operationBusy||decisionListening||resultSaved;
+  $('upload').disabled=operationBusy||decisionListening||resultSaved;
+  $('workflowMode').disabled=operationBusy||decisionListening;
+  $('nextBook').disabled=operationBusy;$('nextBookBottom').disabled=operationBusy;
+  $('searchAgain').disabled=operationBusy||decisionListening||resultSaved;
+  $('saveResult').disabled=operationBusy||decisionListening||resultSaved;
+  $('listenDecision').disabled=operationBusy||decisionListening||!currentResult||resultSaved;
+  $('reviewNow').disabled=!decisionListening;
+  document.querySelectorAll('#gallery select,#gallery button').forEach(input=>input.disabled=operationBusy||decisionListening||resultSaved);
+  document.querySelectorAll('#searchCard input,#searchCard textarea').forEach(input=>input.disabled=operationBusy||decisionListening||resultSaved);
+}
+function applyMode(){
+  stopVoice();workflowPhase=currentResult?'review':'capture';roleSelect.value=fastMode()?'front_cover':'title_page';
+  $('takePhoto').textContent=fastMode()?'Capture cover and check':'Take photo';
+  $('modeHelp').textContent=fastMode()?'Fast mode: one cover photo → catalog results → recorded decision conversation → manual review and Excel save.':'Traditional mode: photograph the pages you need, then extract and check manually.';
+  setStatus('checkStatus',fastMode()?'Point the camera at the front cover, then click Capture cover and check.':'Photograph the title page. Add the copyright page when the edition matters.');
+  try{localStorage.setItem('giftbooksWorkflowMode',$('workflowMode').value);}catch(e){}
+  syncControls();
+}
+function beep(frequency=880,duration=.12){try{const context=new(window.AudioContext||window.webkitAudioContext)(),osc=context.createOscillator(),gain=context.createGain();osc.frequency.value=frequency;gain.gain.value=.08;osc.connect(gain);gain.connect(context.destination);osc.onended=()=>context.close();osc.start();gain.gain.exponentialRampToValueAtTime(.001,context.currentTime+duration);osc.stop(context.currentTime+duration);}catch(e){}}
+function warmModel(){if(!warmupPromise)warmupPromise=fetch('/api/warmup',{method:'POST'}).then(response=>{if(!response.ok)warmupPromise=null;}).catch(()=>{warmupPromise=null;});}
+async function startCamera(){
+  if(stream)return true;warmModel();
+  try{stream=await navigator.mediaDevices.getUserMedia({video:{width:{ideal:1920},height:{ideal:1080},facingMode:{ideal:'environment'}},audio:false});$('video').srcObject=stream;$('startCamera').disabled=true;$('startCamera').textContent='Camera active';syncControls();return true;}
+  catch(error){setStatus('checkStatus','Camera unavailable: '+escapeHtml(error.message),'error');return false;}
+}
+function captureFrame(){
+  const video=$('video');if(!stream||!video.videoWidth){setStatus('checkStatus','Wait for the camera preview to appear.','different');return false;}
+  if(images.length>=8){setStatus('checkStatus','Use no more than eight photographs for one book.','different');return false;}
+  const canvas=$('canvas');canvas.width=video.videoWidth;canvas.height=video.videoHeight;
+  canvas.getContext('2d').drawImage(video,0,0,canvas.width,canvas.height);
+  images.push({data:canvas.toDataURL('image/jpeg',.93),role:fastMode()?'front_cover':roleSelect.value,name:`camera_${images.length+1}.jpg`});
+  renderGallery();beep();return true;
+}
+async function takePhoto(){
+  if(captureBusy||operationBusy||resultSaved||(fastMode()&&workflowPhase!=='capture'))return;
+  captureBusy=true;const clickedAt=performance.now();
+  try{if(captureFrame()){beginTiming(clickedAt);resultSaved=false;if(fastMode()){stopVoice();await checkBook(false);}}}
+  finally{captureBusy=false;syncControls();}
+}
+function renderGallery(){
+  const gallery=$('gallery');gallery.innerHTML='';images.forEach((item,index)=>{
+    const card=document.createElement('div');card.className='shot';const image=document.createElement('img');image.src=item.data;card.appendChild(image);
+    const select=document.createElement('select');roles.forEach(role=>{const option=document.createElement('option');option.value=role;option.textContent=role.replaceAll('_',' ');option.selected=role===item.role;select.appendChild(option);});
+    select.disabled=operationBusy||decisionListening||resultSaved;select.onchange=()=>images[index].role=select.value;card.appendChild(select);
+    const remove=document.createElement('button');remove.className='danger';remove.textContent='Remove';remove.disabled=operationBusy||decisionListening||resultSaved;
+    remove.onclick=()=>{images.splice(index,1);renderGallery();};card.appendChild(remove);gallery.appendChild(card);
+  });$('imageCount').textContent=`${images.length} image${images.length===1?'':'s'}`;syncControls();
+}
+async function addUploads(files){
+  if(operationBusy||decisionListening||resultSaved)return;
+  if(images.length+files.length>8){setStatus('checkStatus','Use no more than eight photographs for one book.','different');return;}
+  if(files.length)beginTiming();
+  operationBusy=true;syncControls();
+  try{for(const file of files){
+    const data=await new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(reader.result);reader.onerror=reject;reader.readAsDataURL(file);});
+    const lower=file.name.toLowerCase(),role=lower.includes('copyright')?'copyright_page':lower.includes('title')?'title_page':lower.includes('spine')?'spine':lower.includes('back')?'back_cover':lower.includes('cover')?'front_cover':'other';
+    images.push({data,role,name:file.name});
+  }}catch(error){setStatus('checkStatus','Upload failed: '+escapeHtml(error.message),'error');}
+  finally{operationBusy=false;$('upload').value='';renderGallery();}
+}
 function metadataFromForm(){const year=$('publication_year').value.trim();return{title:$('title').value.trim()||null,authors:$('authors').value.split('\n').map(x=>x.trim()).filter(Boolean),publication_year:/^\d{4}$/.test(year)?Number(year):null,publisher:$('publisher').value.trim()||null,publication_place:$('publication_place').value.trim()||null,edition:$('edition').value.trim()||null,language:$('language').value.trim()||null,isbn10:$('isbn10').value.trim()||null,isbn13:$('isbn13').value.trim()||null,warnings:[]};}
 function fillForm(metadata){['title','publication_year','publisher','publication_place','edition','language','isbn10','isbn13'].forEach(key=>$(key).value=metadata[key]??'');$('authors').value=(metadata.authors||[]).join('\n');}
-function playResultSound(found){const selected=found?resultSounds.found:resultSounds.notFound,other=found?resultSounds.notFound:resultSounds.found;other.pause();other.currentTime=0;selected.pause();selected.currentTime=0;selected.play().catch(()=>{});}
-function reserveCatalogTab(){const tab=window.open('about:blank','_blank');if(tab){tab.document.title='Illinois Library Catalog search';tab.document.body.innerHTML='<p style="font:16px system-ui;padding:24px">Extracting book information. The Illinois Library Catalog search will open here…</p>';}return tab;}
-function redirectCatalogTab(tab,url){if(!url)return false;if(tab&&!tab.closed){tab.location.replace(url);tab.focus();return true;}return Boolean(window.open(url,'_blank','noopener'));}
-function unlockDisposition(){document.querySelectorAll('input[name="decision"]').forEach(input=>input.disabled=false);$('note').disabled=false;$('saveResult').disabled=false;}
-function showResult(result){currentResult=result;resultSaved=false;unlockDisposition();$('resultCard').classList.remove('hidden');$('decisionCard').classList.remove('hidden');const found=result.status==='found',kind=found?'found':'notfound',elapsed=resultElapsedSeconds===null?'':`<br><span class="muted">From first photo command to displayed result: ${resultElapsedSeconds.toFixed(1)} seconds</span>`;setStatus('resultBanner',`<b>${found?'FOUND':'NOT FOUND'}</b><br>${escapeHtml(result.message)}${elapsed}`,kind);playResultSound(found);const record=found?result.record:null;if(!record){const verification=result.search_url?`<p><a href="${escapeHtml(result.search_url)}" target="_blank" rel="noopener"><b>Open the Illinois Library Catalog search to verify</b></a></p>`:'';$('recordDetails').innerHTML='<p>No exact matching Illinois Library Catalog record was returned.</p>'+verification;}else{const authors=(record.authors||[]).join('; ')||'—';$('recordDetails').innerHTML=`<table><tr><th>Title</th><td>${escapeHtml(record.title||'—')}</td></tr><tr><th>Author</th><td>${escapeHtml(authors)}</td></tr><tr><th>Publication</th><td>${escapeHtml([record.publication_place,record.publisher,record.publication_year].filter(Boolean).join(' · ')||'—')}</td></tr><tr><th>Edition</th><td>${escapeHtml(record.edition||'—')}</td></tr><tr><th>Availability</th><td>${escapeHtml(record.availability||'See catalog record')}</td></tr></table><p><a href="${escapeHtml(record.record_url)}" target="_blank" rel="noopener"><b>Open this Illinois Library Catalog record</b></a></p>`;}setStatus('saveStatus','Choose Keep or Give away before saving.');$('resultCard').scrollIntoView({behavior:'smooth'});}
-async function checkBook(voice=false){if(operationBusy){if(voice)voiceFeedback('Please wait for the current check.','different');return;}if(!images.length){if(voice)voiceFeedback('Take at least one photo first.','different');return;}if(scanStartedAt===null)scanStartedAt=performance.now();const catalogTab=reserveCatalogTab();operationBusy=true;setStatus('checkStatus','<span class="spinner"></span>Extracting scan information and checking the Illinois Library Catalog…');$('check').disabled=true;try{const response=await fetch('/api/check',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({images})});const result=await response.json();if(!response.ok)throw new Error(result.error||'Check failed');fillForm(result.metadata);$('searchCard').classList.remove('hidden');resultElapsedSeconds=Math.round((performance.now()-scanStartedAt)/100)/10;showResult(result.result);const catalogOpened=redirectCatalogTab(catalogTab,result.result.search_url);setStatus('checkStatus',`Illinois Library Catalog check completed in ${resultElapsedSeconds.toFixed(1)} seconds from the first photo command.${catalogOpened?' Catalog search opened in a new tab.':' Your browser blocked the automatic catalog tab; use the catalog link in the result.'}`,'found');if(voice)setTimeout(()=>announceResult(result.result),1450);}catch(error){if(catalogTab&&!catalogTab.closed)catalogTab.close();setStatus('checkStatus',escapeHtml(error.message),'error');if(voice)voiceFeedback('The library check failed. '+error.message,'error');}finally{operationBusy=false;$('check').disabled=!images.length;}}
-async function searchAgain(voice=false){if(operationBusy)return;operationBusy=true;setStatus('checkStatus','<span class="spinner"></span>Searching the Illinois Library Catalog again…');try{const response=await fetch('/api/search',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({metadata:metadataFromForm()})});const result=await response.json();if(!response.ok)throw new Error(result.error||'Search failed');showResult(result.result);setStatus('checkStatus','Illinois Library Catalog search complete.','found');if(voice)setTimeout(()=>announceResult(result.result),1450);}catch(error){setStatus('checkStatus',escapeHtml(error.message),'error');if(voice)voiceFeedback('The library search failed. '+error.message,'error');}finally{operationBusy=false;}}
+function playResultSound(found){if(fastMode()){beep(found?1046:440);return;}const selected=found?resultSounds.found:resultSounds.notFound,other=found?resultSounds.notFound:resultSounds.found;other.pause();other.currentTime=0;selected.pause();selected.currentTime=0;selected.play().catch(()=>{});}
+function reserveCatalogTab(){
+  const tab=window.open('about:blank','_blank',fastMode()?'popup,width=1100,height=850':'');
+  if(tab){tab.document.title='Illinois Library Catalog search';tab.document.body.innerHTML='<p style="font:16px system-ui;padding:24px">Checking the book. Catalog results will appear here…</p>';window.focus();}
+  if(fastMode())catalogWindow=tab;return tab;
+}
+function redirectCatalogTab(tab,url,focus=true){if(!url)return false;try{if(tab&&!tab.closed){tab.location.replace(url);if(focus)tab.focus();return true;}}catch(e){}return false;}
+function returnToReview(message='Review the decision and metadata, then click Save result to Excel.'){
+  workflowPhase='review';stopVoice();
+  if(catalogWindow){try{if(!catalogWindow.closed)catalogWindow.close();}catch(e){}catalogWindow=null;}
+  window.focus();$('decisionCard').scrollIntoView({behavior:'smooth'});setStatus('saveStatus',escapeHtml(message),'different');syncControls();
+}
+function showResult(result){
+  currentResult=result;resultSaved=false;savedScanId=null;
+  document.querySelectorAll('input[name="decision"]').forEach(input=>{input.checked=false;input.disabled=false;});
+  $('note').disabled=false;$('resultCard').classList.remove('hidden');$('decisionCard').classList.remove('hidden');
+  const found=result.status==='found',different=result.status==='different_edition',kind=found?'found':different?'different':'notfound';
+  const metadata=metadataFromForm(),editionWarning=found&&!metadata.publication_year&&!metadata.isbn10&&!metadata.isbn13?'<br><b>Edition is unverified: the photograph did not show a year or ISBN.</b>':'';
+  const elapsed=resultElapsedSeconds===null?'':`<br><span class="muted">Extraction and catalog check: ${resultElapsedSeconds.toFixed(1)} s. Total book time keeps running until Next book.</span>`;
+  setStatus('resultBanner',`<b>${found?'FOUND':different?'DIFFERENT EDITION':'NOT FOUND'}</b><br>${escapeHtml(result.message)}${editionWarning}${elapsed}`,kind);playResultSound(found);
+  const record=result.record;let details='';
+  if(record){details=`<table><tr><th>Title</th><td>${escapeHtml(record.title||'—')}</td></tr><tr><th>Author</th><td>${escapeHtml((record.authors||[]).join('; ')||'—')}</td></tr><tr><th>Publication</th><td>${escapeHtml([record.publication_place,record.publisher,record.publication_year].filter(Boolean).join(' · ')||'—')}</td></tr><tr><th>Edition</th><td>${escapeHtml(record.edition||'—')}</td></tr><tr><th>Availability</th><td>${escapeHtml(record.availability||'See catalog record')}</td></tr></table>`;
+    if(record.record_url)details+=`<p><a href="${escapeHtml(record.record_url)}" target="_blank" rel="noopener">Open this catalog record</a></p>`;
+  }else details='<p>No matching catalog record was returned.</p>';
+  if(result.search_url)details+=`<p><a href="${escapeHtml(result.search_url)}" target="_blank" rel="noopener">Open the Illinois Library Catalog search to verify</a></p>`;
+  $('recordDetails').innerHTML=details;setStatus('saveStatus','Choose Keep or Give away before saving.');$('resultCard').scrollIntoView({behavior:'smooth'});syncControls();
+}
+async function checkBook(voice=false){
+  if(operationBusy||decisionListening||resultSaved)return;
+  if(!images.length){if(voice)voiceFeedback('Take at least one photo first.','different');return;}
+  beginTiming();const photoStartedAt=performance.now(),tab=reserveCatalogTab();operationBusy=true;workflowPhase='checking';renderGallery();
+  setStatus('checkStatus','<span class="spinner"></span>Extracting book information and checking the catalog…');
+  let successful=false;
+  try{const response=await fetch('/api/check',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({images,mode:fastMode()?'fast':'traditional'})});
+    const data=await response.json();if(!response.ok)throw new Error(data.error||'Check failed');
+    fillForm(data.metadata);$('searchCard').classList.remove('hidden');resultElapsedSeconds=Math.round((performance.now()-photoStartedAt)/100)/10;showResult(data.result);
+    const opened=redirectCatalogTab(tab,data.result.search_url,!fastMode());workflowPhase='review';successful=true;
+    setStatus('checkStatus',`Catalog check complete in ${resultElapsedSeconds.toFixed(1)} s.${opened?' Catalog search opened.':' Allow pop-ups or open the catalog link below.'}`,'found');
+    if(voice&&!fastMode())announceResult(data.result);
+  }catch(error){if(tab&&!tab.closed)tab.close();catalogWindow=null;workflowPhase='capture';setStatus('checkStatus',escapeHtml(error.message),'error');if(voice)voiceFeedback('The library check failed. '+error.message,'error');}
+  finally{operationBusy=false;renderGallery();}
+  if(successful&&fastMode())await listenForDecision();
+}
+async function searchAgain(voice=false){
+  if(operationBusy||decisionListening||resultSaved)return;operationBusy=true;syncControls();
+  setStatus('checkStatus','<span class="spinner"></span>Searching the catalog again…');
+  try{const response=await fetch('/api/search',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({metadata:metadataFromForm()})});const data=await response.json();if(!response.ok)throw new Error(data.error||'Search failed');showResult(data.result);setStatus('checkStatus','Catalog search complete.','found');if(voice)announceResult(data.result);}
+  catch(error){setStatus('checkStatus',escapeHtml(error.message),'error');}finally{operationBusy=false;syncControls();}
+}
 function selectedDecision(){return document.querySelector('input[name="decision"]:checked')?.value||'';}
 function wordCount(value){return(value.trim().match(/\S+/g)||[]).length;}
 function updateNoteCount(){const count=wordCount($('note').value);$('noteCount').textContent=`${count} / 20 words`;$('noteCount').className='word-count'+(count>20?' over':' muted');return count;}
-async function saveResult(voice=false){if(operationBusy)return;if(resultSaved){if(voice)voiceFeedback('This result is already saved. Say next book.');return;}if(!currentResult){if(voice)voiceFeedback('There is no result to save.','different');return;}const decision=selectedDecision();if(!decision){setStatus('saveStatus','Choose Keep or Give away before saving.','different');if(voice)voiceFeedback('Choose keep book or give away first.','different');return;}if(updateNoteCount()>20){setStatus('saveStatus','The note must contain no more than 20 words.','error');if(voice)voiceFeedback('The note is longer than twenty words.','error');return;}operationBusy=true;$('saveResult').disabled=true;setStatus('saveStatus','<span class="spinner"></span>Saving to Excel…');try{const response=await fetch('/api/save-result',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({metadata:metadataFromForm(),result:currentResult,decision,note:$('note').value,elapsed_seconds:resultElapsedSeconds})});const saved=await response.json();if(!response.ok)throw new Error(saved.error||'Save failed');resultSaved=true;document.querySelectorAll('input[name="decision"]').forEach(input=>input.disabled=true);$('note').disabled=true;setStatus('saveStatus',`Saved as ${escapeHtml(saved.scan_id)} in data/illinois_library_scan_results.xlsx.`,'found');if(voice)voiceFeedback('Result saved. Say next book.');}catch(error){setStatus('saveStatus',escapeHtml(error.message),'error');if(voice)voiceFeedback('Saving failed. '+error.message,'error');}finally{operationBusy=false;$('saveResult').disabled=resultSaved;}}
-function resetBook(spoken=false){images=[];currentResult=null;scanStartedAt=null;resultElapsedSeconds=null;resultSaved=false;renderGallery();fillForm({authors:[]});$('searchCard').classList.add('hidden');$('resultCard').classList.add('hidden');$('decisionCard').classList.add('hidden');document.querySelectorAll('input[name="decision"]').forEach(input=>{input.checked=false;input.disabled=false;});$('note').value='';$('note').disabled=false;$('saveResult').disabled=false;updateNoteCount();setStatus('checkStatus','Ready for the next book. Photograph the title page.');window.scrollTo({top:0,behavior:'smooth'});if(spoken)voiceFeedback('Ready for the next book.');}
-function speak(message){if(!('speechSynthesis'in window))return;window.speechSynthesis.cancel();const utterance=new SpeechSynthesisUtterance(message);utterance.rate=1.08;utterance.onstart=()=>ignoreSpeechUntil=Date.now()+700;utterance.onend=()=>ignoreSpeechUntil=Date.now()+900;window.speechSynthesis.speak(utterance);}
-function voiceFeedback(message,kind='found'){setStatus('voiceStatus',escapeHtml(message),kind);speak(message);}
+function blobDataUrl(blob){return new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(reader.result);reader.onerror=reject;reader.readAsDataURL(blob);});}
+async function saveResult(voice=false){
+  if(operationBusy||resultSaved||!currentResult||decisionListening)return;
+  const decision=selectedDecision();if(!decision){setStatus('saveStatus','Choose Keep or Give away before saving.','different');return;}
+  if(updateNoteCount()>20){setStatus('saveStatus','The note must contain no more than 20 words.','error');return;}
+  operationBusy=true;syncControls();setStatus('saveStatus','<span class="spinner"></span>Saving to Excel…');
+  try{if(fastMode())stopVoice();else stopRecording();await recordingDone;
+    const audio=audioBlob?await blobDataUrl(audioBlob):null;
+    const response=await fetch('/api/save-result',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({metadata:metadataFromForm(),result:currentResult,decision,note:$('note').value,elapsed_seconds:elapsedSeconds(),conversation:{transcript,audio}})});
+    const saved=await response.json();if(!response.ok)throw new Error(saved.error||'Save failed');
+    resultSaved=true;savedScanId=saved.scan_id;document.querySelectorAll('input[name="decision"]').forEach(input=>input.disabled=true);$('note').disabled=true;
+    setStatus('saveStatus',`Saved as ${escapeHtml(saved.scan_id)}. Click Next book to finalize the total processing time.`,'found');if(voice)voiceFeedback('Result saved. Say next book.');
+  }catch(error){setStatus('saveStatus',escapeHtml(error.message),'error');}finally{operationBusy=false;syncControls();}
+}
+async function advanceBook(spoken=false){
+  if(operationBusy)return;
+  if((images.length||currentResult)&&!resultSaved&&!confirm('This book has not been saved. Begin the next book anyway?'))return;
+  const clickedAt=performance.now(),total=elapsedSeconds(clickedAt),wasSaved=Boolean(savedScanId),resumeVoice=voiceEnabled&&!fastMode();
+  operationBusy=true;syncControls();
+  try{if(savedScanId){const response=await fetch('/api/finalize-time',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({scan_id:savedScanId,elapsed_seconds:total})});const data=await response.json();if(!response.ok)throw new Error(data.error||'Could not finalize timing');}
+    resetBook(clickedAt);$('lastBookTime').textContent=total?`Previous book: ${total.toFixed(1)} s${wasSaved?'':' (not saved)'}`:'';if(resumeVoice)await startVoice();if(spoken)voiceFeedback('Ready for the next book.');
+  }catch(error){setStatus('saveStatus','Could not finalize book time: '+escapeHtml(error.message)+'. Close the workbook in Excel and retry Next book.','error');}
+  finally{operationBusy=false;syncControls();}
+}
+function resetBook(startAt=null){
+  ++bookGeneration;stopVoice();if(catalogWindow){try{catalogWindow.close();}catch(e){}catalogWindow=null;}
+  images=[];currentResult=null;scanStartedAt=startAt;resultElapsedSeconds=null;resultSaved=false;savedScanId=null;workflowPhase='capture';
+  transcript=[];audioBlob=null;recordingDone=Promise.resolve();decisionProposal=null;pendingVoiceAction=null;lastCommand='';lastCommandAt=0;
+  fillForm({authors:[]});['searchCard','resultCard','decisionCard'].forEach(id=>$(id).classList.add('hidden'));
+  document.querySelectorAll('input[name="decision"]').forEach(input=>{input.checked=false;input.disabled=false;});$('note').value='';$('note').disabled=false;
+  $('upload').value='';$('voiceTranscript').textContent='No conversation recorded.';setStatus('conversationStatus','Fast mode records the decision conversation after the catalog check.');
+  roleSelect.value=fastMode()?'front_cover':'title_page';renderGallery();updateNoteCount();updateTimer();setStatus('checkStatus',fastMode()?'Ready for the next book. Photograph the front cover.':'Ready for the next book. Photograph the title page.');window.scrollTo({top:0,behavior:'smooth'});
+}
+function speak(message){if(!('speechSynthesis'in window))return;window.speechSynthesis.cancel();const utterance=new SpeechSynthesisUtterance(message);utterance.rate=1.08;ignoreSpeechUntil=Date.now()+10000;utterance.onend=utterance.onerror=()=>ignoreSpeechUntil=Date.now()+500;window.speechSynthesis.speak(utterance);}
+function voiceFeedback(message,kind='found'){setStatus('voiceStatus',escapeHtml(message),kind);if(!decisionListening)speak(message);}
 function askVoice(message,action){pendingVoiceAction=action;voiceFeedback(message+' Say yes or no.','different');}
-function announceResult(result){if(result.status==='found')voiceFeedback('Found in the Illinois Library Catalog. Choose keep book or give away.');else voiceFeedback('Not found in the Illinois Library Catalog. Choose keep book or give away.','notfound');}
-async function enableHandsFree(){await startCamera();startVoice();}
-function startVoice(){if(voiceEnabled)return;const SpeechRecognition=window.SpeechRecognition||window.webkitSpeechRecognition;if(!SpeechRecognition){setStatus('voiceStatus','Speech recognition is not supported by this browser.','error');return;}recognition=new SpeechRecognition();recognition.continuous=true;recognition.interimResults=false;recognition.lang='en-US';recognition.maxAlternatives=3;if($('localSpeech').checked&&'processLocally'in recognition)recognition.processLocally=true;recognition.onstart=()=>setStatus('voiceStatus','Hands-free mode is listening. Say help for commands.','found');recognition.onresult=event=>{if(Date.now()<ignoreSpeechUntil)return;for(let index=event.resultIndex;index<event.results.length;index++){if(!event.results[index].isFinal)continue;const raw=event.results[index][0].transcript.trim(),normalized=raw.toLowerCase().replace(/[^a-z0-9 ]/g,' ').replace(/\s+/g,' ').trim();handleVoice(normalized,raw);}};recognition.onerror=event=>setStatus('voiceStatus','Voice error: '+escapeHtml(event.error),'error');recognition.onend=()=>{if(voiceEnabled){try{recognition.start();}catch(e){}}};voiceEnabled=true;$('voiceToggle').textContent='Stop voice control';$('voiceToggle').className='danger';try{recognition.start();}catch(error){setStatus('voiceStatus',escapeHtml(error.message),'error');}}
-function stopVoice(){voiceEnabled=false;if(recognition)recognition.stop();window.speechSynthesis?.cancel();$('voiceToggle').textContent='Enable hands-free mode';$('voiceToggle').className='secondary';setStatus('voiceStatus','Voice control is off.');}
+function announceResult(result){voiceFeedback(result.status==='found'?'Found in the Illinois Library Catalog. Choose keep book or give away.':result.status==='different_edition'?'A different edition was found. Choose keep book or give away.':'Not found in the Illinois Library Catalog. Choose keep book or give away.');}
+async function enableHandsFree(){await startCamera();await startVoice();}
+function failVoice(message){if(decisionListening)returnToReview(message+' Choose Keep or Give away manually.');else stopVoice();setStatus('voiceStatus',escapeHtml(message),'error');}
+function updateVoiceButton(){$('voiceToggle').textContent=voiceEnabled?'Stop voice control':'Enable hands-free mode';$('voiceToggle').className=voiceEnabled?'danger':'secondary';}
+async function startVoice(){
+  if(voiceEnabled)return true;
+  const SpeechRecognition=window.SpeechRecognition||window.webkitSpeechRecognition;
+  if(!SpeechRecognition){setStatus('voiceStatus','Speech recognition is unavailable. Choose Keep or Give away manually.','error');return false;}
+  const listener=new SpeechRecognition(),generation=++voiceGeneration;recognition=listener;
+  listener.continuous=true;listener.interimResults=decisionListening;listener.lang='en-US';listener.maxAlternatives=1;
+  if($('localSpeech').checked){if(!('processLocally'in listener)){setStatus('voiceStatus','This browser cannot require on-device speech recognition. Choose manually or change the speech setting.','error');return false;}listener.processLocally=true;}
+  voiceEnabled=true;updateVoiceButton();
+  return await new Promise(resolve=>{
+    let settled=false,retries=0;const finish=value=>{if(!settled){settled=true;clearTimeout(startTimeout);resolve(value);}};
+    const startTimeout=setTimeout(()=>{if(generation===voiceGeneration){failVoice('Microphone did not start. Click Listen for a decision or choose manually.');}finish(false);},8000);
+    listener.onstart=()=>{if(generation!==voiceGeneration||!voiceEnabled){listener.abort();finish(false);return;}setStatus('voiceStatus',decisionListening?'Listening to the decision conversation.':'Hands-free mode is listening. Say help for commands.','found');finish(true);if(decisionListening&&catalogWindow&&!catalogWindow.closed){try{catalogWindow.focus();}catch(e){}}};
+    listener.onresult=event=>{if(!voiceEnabled||generation!==voiceGeneration||Date.now()<ignoreSpeechUntil)return;retries=0;
+      for(let index=event.resultIndex;index<event.results.length;index++){if(!voiceEnabled)break;if(!event.results[index].isFinal){if(decisionListening){clearTimeout(decisionTimer);decisionTimer=null;}continue;}const raw=event.results[index][0].transcript.trim();if(decisionListening)recordUtterance(raw);else handleVoice(normalizeCommand(raw),raw);}
+    };
+    listener.onerror=event=>{if(generation!==voiceGeneration||!voiceEnabled)return;
+      if(['not-allowed','service-not-allowed','audio-capture','language-not-supported'].includes(event.error)){failVoice('Voice unavailable: '+event.error+'. Click Listen for a decision to retry, or choose manually.');finish(false);}
+      else if(event.error!=='no-speech'&&event.error!=='aborted')setStatus('voiceStatus','Voice error: '+escapeHtml(event.error),'error');
+    };
+    listener.onend=()=>{if(!voiceEnabled||generation!==voiceGeneration){finish(false);return;}
+      if(++retries>5){failVoice('Voice recognition stopped repeatedly. Retry listening or choose manually.');finish(false);return;}
+      voiceRestartTimer=setTimeout(()=>{if(!voiceEnabled||generation!==voiceGeneration)return;try{listener.start();}catch(error){failVoice(error.message);finish(false);}},300);
+    };
+    try{listener.start();}catch(error){failVoice(error.message);finish(false);}
+  });
+}
+function stopRecording(){
+  clearTimeout(recordingTimer);recordingTimer=null;
+  if(recorder&&recorder.state!=='inactive'){try{recorder.stop();}catch(e){}}recorder=null;
+  if(audioStream){audioStream.getTracks().forEach(track=>track.stop());audioStream=null;}
+}
+function stopVoice(){
+  ++voiceGeneration;++conversationGeneration;voiceEnabled=false;decisionListening=false;clearTimeout(voiceRestartTimer);clearTimeout(decisionTimer);decisionTimer=null;
+  if(recognition){const previous=recognition;recognition=null;try{previous.abort();}catch(e){}}
+  stopRecording();window.speechSynthesis?.cancel();ignoreSpeechUntil=0;updateVoiceButton();setStatus('voiceStatus','Voice control is off.');syncControls();
+}
+async function startRecording(generation){
+  if(!window.MediaRecorder){setStatus('conversationStatus','Audio recording is unavailable; the recognized transcript will be saved.','different');return;}
+  try{const acquired=await navigator.mediaDevices.getUserMedia({audio:true,video:false});
+    if(generation!==conversationGeneration||!decisionListening){acquired.getTracks().forEach(track=>track.stop());return;}
+    audioStream=acquired;const mime=['audio/webm;codecs=opus','audio/mp4','audio/ogg;codecs=opus'].find(type=>MediaRecorder.isTypeSupported(type));
+    const active=new MediaRecorder(acquired,mime?{mimeType:mime}:undefined),chunks=[],recordingBook=bookGeneration;recorder=active;
+    recordingDone=new Promise(resolve=>{active.ondataavailable=event=>{if(event.data.size)chunks.push(event.data);};active.onstop=()=>{if(recordingBook===bookGeneration)audioBlob=new Blob(chunks,{type:active.mimeType||mime||'audio/webm'});resolve();};active.onerror=()=>{resolve();setStatus('conversationStatus','Audio recording failed; the transcript will be saved.','different');};});
+    active.start(1000);setStatus('conversationStatus','Recording audio and transcribing the decision conversation.','found');
+    recordingTimer=setTimeout(()=>returnToReview('Recording reached five minutes. Review the decision manually before saving.'),300000);
+  }catch(error){if(generation===conversationGeneration)setStatus('conversationStatus','Audio recording unavailable: '+escapeHtml(error.message)+'. Recognized text will still be saved.','different');}
+}
+async function listenForDecision(){
+  if(!currentResult||operationBusy||resultSaved||decisionListening)return;
+  stopVoice();await recordingDone;audioBlob=null;
+  decisionListening=true;workflowPhase='listening';decisionProposal=null;ignoreSpeechUntil=0;
+  const generation=++conversationGeneration,sessionBook=bookGeneration;syncControls();
+  setStatus('conversationStatus','Starting the microphone. Say your decision, such as “Let’s keep this” or “We should give this away.”');
+  await startRecording(generation);
+  if(generation!==conversationGeneration||!decisionListening)return;
+  const started=await startVoice();
+  if(!started&&sessionBook===bookGeneration&&currentResult)returnToReview('Voice recognition is unavailable. Choose Keep or Give away manually.');
+}
+function normalizeCommand(raw){return raw.toLowerCase().replace(/[’']/g,"'").replace(/[^a-z0-9' ]/g,' ').replace(/\s+/g,' ').trim();}
+function inferDecision(raw){
+  const text=normalizeCommand(raw);
+  if(/\?|\b(maybe|perhaps|unsure|uncertain|not sure|cannot decide|can't decide|if|whether|either|should we|shall we|can we|could we|would you)\b/i.test(raw))return null;
+  // Accept an explicit correction after "but" or "actually". Questions,
+  // alternatives, and conflicting choices remain for manual review.
+  const clause=text.split(/\b(?:but|actually)\b/).pop(),choices=new Set();
+  const pattern=/\b(keep|retain|give (?:it |this |this book |the book )?away|donate|donation)\b/g;
+  let match,lastMatchEnd=0;while((match=pattern.exec(clause))){
+    const before=clause.slice(lastMatchEnd,match.index).split(/[,.;]/).pop().split(/\s+/).slice(-6).join(' ');
+    const negated=/\b(not|never|don't|do not|shouldn't|should not|won't|will not|can't|cannot)\b/.test(before);
+    let choice=/^(keep|retain)$/.test(match[1])?'keep':'give away';if(negated)choice=choice==='keep'?'give away':'keep';choices.add(choice);lastMatchEnd=pattern.lastIndex;
+  }
+  return choices.size===1?[...choices][0]:null;
+}
+function recordUtterance(raw){
+  transcript.push({text:raw,at_seconds:elapsedSeconds()});$('voiceTranscript').textContent=transcript.map(entry=>`[${entry.at_seconds.toFixed(1)} s] ${entry.text}`).join('\n');
+  if(/\b(stop listening|stop voice|review decision)\b/i.test(raw)){returnToReview();return;}
+  clearTimeout(decisionTimer);decisionTimer=null;const inferred=inferDecision(raw);
+  if(inferred||/\b(keep|retain|give|donate|donation|maybe|unsure|not sure|cancel)\b/i.test(raw))decisionProposal=inferred;
+  if(!decisionProposal){setStatus('conversationStatus','No clear decision yet. Say “keep this book” or “give this away,” or stop listening and review manually.','different');return;}
+  const proposal=decisionProposal;setStatus('conversationStatus',`Heard ${escapeHtml(proposal)}. Waiting briefly for any correction…`,'found');
+  decisionTimer=setTimeout(()=>{if(!decisionListening||decisionProposal!==proposal)return;const input=document.querySelector(`input[name="decision"][value="${proposal}"]`);input.checked=true;resultSaved=false;returnToReview(`Voice selected ${proposal}. Listening is off. Check the decision and metadata, then save manually.`);setStatus('conversationStatus',`Conversation recorded. Voice proposed ${escapeHtml(proposal)}; final review is yours.`,'found');},2500);
+}
 function handleVoice(command,raw=command){
-  if(command===lastCommand&&Date.now()-lastCommandAt<1800)return;
-  lastCommand=command;lastCommandAt=Date.now();setStatus('voiceStatus','Heard: '+escapeHtml(command),'found');
+  if(operationBusy)return;if(command===lastCommand&&Date.now()-lastCommandAt<1800)return;lastCommand=command;lastCommandAt=Date.now();setStatus('voiceStatus','Heard: '+escapeHtml(raw),'found');
   if(/\b(stop listening|stop voice)\b/.test(command)){stopVoice();return;}
-  if(/\b(no|cancel)\b/.test(command)&&pendingVoiceAction){pendingVoiceAction=null;voiceFeedback('Cancelled.');return;}
-  if(/\b(yes|confirm)\b/.test(command)&&pendingVoiceAction){const action=pendingVoiceAction;pendingVoiceAction=null;action();return;}
-  if(pendingVoiceAction){voiceFeedback('Say yes or no.','different');return;}
+  if(pendingVoiceAction){if(/^(no|cancel)$/.test(command)){pendingVoiceAction=null;voiceFeedback('Cancelled.');return;}if(/^(yes|confirm)$/.test(command)){const action=pendingVoiceAction;pendingVoiceAction=null;action();return;}voiceFeedback('Say yes or no.','different');return;}
   if(/\b(help|commands)\b/.test(command)){voiceFeedback('Say a page type, take photo, check library, keep book or give away, set note, save result, or next book.');return;}
-  if(/\b(title page)\b/.test(command)){roleSelect.value='title_page';voiceFeedback('Title page selected.');return;}
-  if(/\b(copyright|publication page)\b/.test(command)){roleSelect.value='copyright_page';voiceFeedback('Copyright page selected.');return;}
-  if(/\b(front cover)\b/.test(command)){roleSelect.value='front_cover';voiceFeedback('Front cover selected.');return;}
-  if(/\b(back cover)\b/.test(command)){roleSelect.value='back_cover';voiceFeedback('Back cover selected.');return;}
-  if(/\b(spine)\b/.test(command)){roleSelect.value='spine';voiceFeedback('Spine selected.');return;}
-  if(/\b(take photo|capture|photo)\b/.test(command)){if(stream)countdownCapture();else voiceFeedback('Start the camera first.','different');return;}
-  if(/\b(remove last|delete last)\b/.test(command)){if(images.length){images.pop();resultSaved=false;renderGallery();voiceFeedback('Last photo removed.');}else voiceFeedback('There are no photos.','different');return;}
-  if(/\b(clear photos)\b/.test(command)){askVoice('Clear all current photos?',()=>resetBook(true));return;}
+  const page=command.match(/\b(title page|copyright|publication page|front cover|back cover|spine)\b/);if(page){roleSelect.value={'title page':'title_page',copyright:'copyright_page','publication page':'copyright_page','front cover':'front_cover','back cover':'back_cover',spine:'spine'}[page[1]];voiceFeedback('Page type selected.');return;}
+  if(/\b(take photo|capture|photo)\b/.test(command)){takePhoto();return;}
+  if(/\b(next book|new book)\b/.test(command)){advanceBook(true);return;}
+  if(resultSaved){voiceFeedback('This result is saved. Say next book.');return;}
+  if(/\b(remove last|delete last)\b/.test(command)){images.pop();renderGallery();voiceFeedback('Last photo removed.');return;}
+  if(/\b(clear photos)\b/.test(command)){askVoice('Clear all current photos?',()=>resetBook(scanStartedAt));return;}
   if(/\b(check library|check illinois library|search library)\b/.test(command)){checkBook(true);return;}
-  let match=raw.match(/^set title\s+(.+)$/i);if(match){$('title').value=match[1].trim();resultSaved=false;voiceFeedback('Title updated.');return;}
-  match=raw.match(/^set author\s+(.+)$/i);if(match){$('authors').value=match[1].trim();resultSaved=false;voiceFeedback('Author updated.');return;}
-  match=command.match(/^set year\s+(\d{4})$/);if(match){$('publication_year').value=match[1];resultSaved=false;voiceFeedback('Year updated.');return;}
-  match=raw.match(/^set language\s+(.+)$/i);if(match){$('language').value=match[1].trim();resultSaved=false;voiceFeedback('Language updated.');return;}
-  match=raw.match(/^set note\s+(.+)$/i);if(match){$('note').value=match[1].trim();updateNoteCount();voiceFeedback(updateNoteCount()<=20?'Note updated.':'The note is longer than twenty words.',updateNoteCount()<=20?'found':'error');return;}
+  const field=raw.match(/^set (title|author|year|language|note)\s+(.+)$/i);if(field){const id={author:'authors',year:'publication_year'}[field[1].toLowerCase()]||field[1].toLowerCase();$(id).value=field[2].trim();updateNoteCount();voiceFeedback('Updated.');return;}
   if(/\b(clear note)\b/.test(command)){$('note').value='';updateNoteCount();voiceFeedback('Note cleared.');return;}
   if(/\b(search again|check again)\b/.test(command)){searchAgain(true);return;}
-  if(/\b(read result|result)\b/.test(command)){if(currentResult)announceResult(currentResult);else voiceFeedback('There is no result yet.','different');return;}
-  if(/\b(keep book|keep)\b/.test(command)){const input=document.querySelector('input[name="decision"][value="keep"]');if(input){input.checked=true;resultSaved=false;voiceFeedback('Keep selected. Say save result when ready.');}return;}
-  if(/\b(give away|give away book)\b/.test(command)){const input=document.querySelector('input[name="decision"][value="give away"]');if(input){input.checked=true;resultSaved=false;voiceFeedback('Give away selected. Say save result when ready.');}return;}
-  if(/\b(save result|save entry|save book)\b/.test(command)){saveResult(true);return;}
-  if(/\b(next book|new book)\b/.test(command)){if(currentResult&&!resultSaved)askVoice('This result has not been saved. Begin the next book anyway?',()=>resetBook(true));else resetBook(true);return;}
-  voiceFeedback('Command not recognized. Say help.','different');
+  if(/\b(read result|result)\b/.test(command)){if(currentResult)announceResult(currentResult);return;}
+  const choice=inferDecision(raw);if(choice&&currentResult){document.querySelector(`input[name="decision"][value="${choice}"]`).checked=true;voiceFeedback(choice+' selected. Say save result when ready.');return;}
+  if(/\b(save result|save entry|save book)\b/.test(command)){saveResult(true);return;}voiceFeedback('Command not recognized. Say help.','different');
 }
-$('startCamera').onclick=startCamera;
-$('takePhoto').onclick=countdownCapture;
-$('voiceToggle').onclick=()=>voiceEnabled?stopVoice():enableHandsFree();
-$('upload').onchange=event=>addUploads(event.target.files);
-$('check').onclick=()=>checkBook(false);
-$('clearPhotos').onclick=()=>{if(images.length&&confirm('Clear all current photos and results?'))resetBook(false);};
-$('searchAgain').onclick=()=>searchAgain(false);
-$('saveResult').onclick=()=>saveResult(false);
-$('nextBook').onclick=()=>{if(currentResult&&!resultSaved){if(confirm('This result has not been saved. Begin the next book anyway?'))resetBook(false);}else resetBook(false);};
-$('note').oninput=updateNoteCount;
-document.querySelectorAll('input[name="decision"]').forEach(input=>input.onchange=()=>{resultSaved=false;});
-document.addEventListener('keydown',event=>{const tag=(event.target?.tagName||'').toLowerCase();if(event.key==='Enter'&&!voiceEnabled&&!['input','textarea','select'].includes(tag)){event.preventDefault();enableHandsFree();}});
-renderGallery();updateNoteCount();
+$('startCamera').onclick=startCamera;$('takePhoto').onclick=takePhoto;
+$('workflowMode').onchange=applyMode;$('voiceToggle').onclick=()=>voiceEnabled?stopVoice():enableHandsFree();
+$('upload').onchange=event=>addUploads(event.target.files);$('check').onclick=()=>checkBook(false);
+$('clearPhotos').onclick=()=>{if(!operationBusy&&!decisionListening&&!resultSaved&&confirm('Clear all current photos and results?'))resetBook(scanStartedAt);};
+$('searchAgain').onclick=()=>searchAgain(false);$('saveResult').onclick=()=>saveResult(false);
+$('nextBook').onclick=$('nextBookBottom').onclick=()=>advanceBook(false);
+$('listenDecision').onclick=listenForDecision;$('reviewNow').onclick=()=>returnToReview();$('note').oninput=updateNoteCount;
+document.querySelectorAll('input[name="decision"]').forEach(input=>input.onchange=()=>{if(decisionListening)returnToReview();resultSaved=false;});
+document.addEventListener('keydown',event=>{const tag=(event.target?.tagName||'').toLowerCase();if(event.key==='Enter'&&!voiceEnabled&&!operationBusy&&!['input','textarea','select','button'].includes(tag)){event.preventDefault();if(fastMode()&&currentResult)listenForDecision();else enableHandsFree();}});
+window.addEventListener('beforeunload',event=>{if(images.length||savedScanId){event.preventDefault();event.returnValue='';}});
+window.addEventListener('pagehide',()=>{stopVoice();if(stream)stream.getTracks().forEach(track=>track.stop());});
+try{const preference=localStorage.getItem('giftbooksWorkflowMode');if(['fast','traditional'].includes(preference))$('workflowMode').value=preference;}catch(e){}
+applyMode();renderGallery();updateNoteCount();
 </script>
 </body></html>
 """
@@ -2131,7 +2439,7 @@ def api_check():
     try:
         started = time.perf_counter()
         payload = request.get_json(force=True)
-        metadata, _ = extract_search_metadata(payload.get("images") or [])
+        metadata, _ = extract_search_metadata(payload.get("images") or [], fast=payload.get("mode") == "fast")
         result = search_illinois_catalog(metadata)
         return jsonify({"metadata": metadata.model_dump(mode="json"), "result": result,
                         "elapsed_seconds": round(time.perf_counter() - started, 1)})
@@ -2141,6 +2449,15 @@ def api_check():
         return jsonify({"error": f"The Illinois Library Catalog could not be reached: {error}"}), 502
     except Exception as error:
         return jsonify({"error": f"Book check failed: {error}"}), 500
+
+
+@app.post("/api/warmup")
+def api_warmup():
+    try:
+        get_model_bundle()
+        return jsonify({"ready": True})
+    except Exception as error:
+        return jsonify({"error": f"Model warmup failed: {error}"}), 500
 
 
 @app.post("/api/search")
@@ -2169,9 +2486,19 @@ def api_save_result():
             decision=str(payload.get("decision") or ""),
             note=str(payload.get("note") or ""),
             elapsed_seconds=payload.get("elapsed_seconds"),
+            conversation=payload.get("conversation"),
         )
         return jsonify(saved)
     except (ValueError, ValidationError, OSError) as error:
+        return jsonify({"error": str(error)}), 400
+
+
+@app.post("/api/finalize-time")
+def api_finalize_time():
+    try:
+        payload = request.get_json(force=True)
+        return jsonify(finalize_processing_time(str(payload.get("scan_id") or ""), payload.get("elapsed_seconds")))
+    except (ValueError, OSError) as error:
         return jsonify({"error": str(error)}), 400
 
 
