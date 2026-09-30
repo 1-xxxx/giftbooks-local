@@ -13,6 +13,8 @@ The book images are analyzed on your Mac. No Gemini, OpenAI, or other paid AI AP
 5. Lets you mark the physical book as **Keep** or **Give away** and add an optional note of up to 20 words.
 6. Saves each completed scan to an Excel workbook.
 7. Supports voice commands and plays different sounds for found and not-found results.
+8. Offers **Fast mode** for one-click cover capture, catalog checking, and a recorded voice decision followed by manual review.
+9. Tracks the complete book-processing cycle, including discussion, review, and saving.
 
 ## What you need
 
@@ -57,11 +59,29 @@ http://127.0.0.1:8502
 
 Allow camera and microphone access when the browser asks.
 
-## Scan a book
+## Fast mode
+
+1. Select **Fast mode** and click **Start camera** once. Allow camera, microphone, and pop-ups when requested.
+2. Click **Next book** to start the first book's timer, or start with a photograph; that first cycle will start at capture.
+3. Point the camera at the front cover and click **Capture cover and check**. Capture is immediate. Extraction and catalog checking start automatically.
+4. Review the automatically opened catalog search. The app starts recording and transcribing the decision conversation as soon as the catalog check finishes.
+5. Say a clear decision, for example **“Let's keep this book”**, **“We should give this away”**, or **“Actually, donate it.”** After 2.5 seconds without further recognized speech, the app selects the decision, stops recognition and recording, closes its catalog window, and requests focus on the app for review.
+6. Check the decision, book information, and transcript manually. Correct the decision if needed, add a note, and click **Save result to Excel**.
+7. Click **Next book**. The app updates that saved Excel row with the complete elapsed time and starts the next book's timer at the click.
+
+The decision interpreter uses explicit English keep/donate phrases with simple negation and corrections; it does not perform general conversation reasoning or speaker identification. Questions, uncertain statements, and conflicting choices wait for a clearer statement or manual review. **Stop listening and review** ends listening immediately; **Listen for a decision** retries it. Recording also stops at five minutes. A retry retains the transcript but replaces the audio with the latest listening session.
+
+Cover-only scans may not show a publication year, ISBN, or edition. The app flags an unverified edition when a title match lacks a scanned year or ISBN. Use traditional mode and photograph the copyright page when exact-edition evidence is needed.
+
+Pop-up and window-focus behavior depend on the browser. If a catalog window or automatic return is blocked, use the inline catalog link and return to the GiftBooks window manually. Speech recognition needs browser support and microphone permission; manual decisions remain available when recognition fails.
+
+## Traditional mode
+
+Traditional mode is the default and keeps the original multi-photo, manually triggered checking workflow. The selected mode is remembered in the browser.
 
 1. Click **Start camera**.
 2. Choose the part of the book being photographed, such as **title page** or **copyright page**.
-3. Click **Take photo**. A countdown runs from 1.0 to 0.0 seconds.
+3. Click **Take photo**. The picture is taken immediately, with no countdown.
 4. Photograph at least the title page. Add the copyright or publication page when the edition and year matter.
 5. Click **Extract and check Illinois Library Catalog**.
 
@@ -103,7 +123,7 @@ Useful commands include:
 - `next book`
 - `stop listening`
 
-Browser speech recognition support varies. When available, select **Require on-device recognition when supported** to prefer local recognition. Some browsers may still use an online speech service.
+Browser speech recognition support varies. Select **Require on-device speech recognition** to require local processing. If the browser cannot enforce local recognition or the language pack is unavailable, recognition fails visibly instead of silently using a remote service. When this setting is off, the browser may use an online speech service.
 
 ## Excel results
 
@@ -122,10 +142,24 @@ The workbook contains one row per saved scan, including:
 - Catalog search URL when not found
 - Keep or Give Away decision
 - Optional note
-- Processing time
+- Total processing time from one **Next book** click to the next (the first book starts at capture unless you click **Next book** first)
 - UTC timestamp
 
 The app creates the workbook automatically. Close the workbook in Excel before saving another result if Excel prevents the file from being updated.
+
+At **Save result to Excel**, processing time is provisional. **Next book** finalizes the same row, including review, saving, and the time up to that click; it does not append a duplicate. Click **Next book** after the last saved book as well, before closing the app. If updating the workbook fails, the app keeps the current book so you can close Excel and retry. Clearing photos does not restart a running timer. Starting an unsaved next book discards that book's recording and does not create an Excel row.
+
+Recorded audio and timestamped transcripts are saved with the result under `data/conversations/`, named using the Excel scan ID. Audio is saved when the browser supports MediaRecorder and microphone recording; otherwise the recognized transcript is saved. Recordings are not saved if you discard the book without saving its result.
+
+## Speed improvements
+
+- Camera capture has no countdown.
+- Model loading starts when the camera is started, overlapping camera setup and positioning; the loaded model is reused.
+- ISBN and title searches run concurrently, using reusable HTTP connections. A failed request is reported as an error rather than a partial Not Found result.
+- Image normalization reads from memory instead of writing and rereading a source file.
+- Fast mode uses a maximum image edge of 1400 pixels; traditional mode retains 1800 pixels. Small or blurry cover text may need the larger setting. Override with `GIFTBOOKS_FAST_IMAGE_SIZE=1800 python giftbooks_local_v2.py` (allowed range: 1000–1800).
+
+Local-model inference speed still depends on the Mac, model, and photograph. No live Mac benchmark is claimed. Automatic book detection, image-role classification, and labeled-image training remain deferred.
 
 ## Stop the app
 
@@ -187,6 +221,24 @@ Allow pop-ups from `127.0.0.1` in your browser. The result card also contains a 
 - Catalog search terms are sent to the Illinois Library Catalog.
 - Browser voice recognition may use an online service, depending on the browser and settings.
 - Scan results are stored locally in the Excel workbook.
+- Decision audio and transcripts are stored locally when the scan is saved. Recording is visible in the interface and stops before final review.
+
+## Development checks
+
+Backend regression tests use the real Flask, Pillow, and Excel libraries with a stub for Mac-only MLX:
+
+```bash
+python -m unittest discover -s tests -p 'test_*.py' -v
+```
+
+Interface tests use Node 22+ and jsdom, with simulated camera, microphone, recognition, catalog responses, and clock:
+
+```bash
+npm install --no-save --package-lock=false jsdom
+node --test tests/workflow.test.cjs
+```
+
+These checks exercise state transitions, saving, recording, failures, and timing. Test camera capture, actual speech recognition, catalog-window focus, and local-model accuracy on the target Mac before relying on the faster image setting.
 
 ## Project files
 
